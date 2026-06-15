@@ -1,15 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createAssistantChatStream, type AssistantMessage } from '@/lib/ai/chat';
+import type { AssistantStreamEvent } from '@/lib/ai/assistant-events';
+import type { AssistantIntentId } from '@/lib/ai/assistant-workbench';
 import {
-  buildAssistantActions,
-  type AssistantIntentId,
-} from '@/lib/ai/assistant-workbench';
-import {
-  getAssistantReferenceItems,
-  getItemById,
-  type AssistantReferenceItem,
-} from '@/lib/db/queries';
-import { parseJsonArray } from '@/lib/utils';
+  assistantTools,
+  buildActionsTool,
+  buildDailyBriefArtifactTool,
+  getCurrentItemContextTool,
+  searchReferencesTool,
+} from '@/lib/ai/tools';
 
 type ChatRequestBody = {
   message?: string;
@@ -19,28 +18,7 @@ type ChatRequestBody = {
   history?: AssistantMessage[];
 };
 
-function buildItemContext(item: NonNullable<Awaited<ReturnType<typeof getItemById>>>) {
-  const tags = parseJsonArray(item.tags);
-  const keyPoints = parseJsonArray(item.keyPoints);
-
-  return [
-    `中文标题：${item.titleCn || item.title}`,
-    item.titleCn && item.titleCn !== item.title ? `原始标题：${item.title}` : '',
-    `来源：${item.source}`,
-    `原文链接：${item.url}`,
-    item.publishedAt ? `发布时间：${item.publishedAt}` : '',
-    item.category ? `类型：${item.category}` : '',
-    item.importance ? `重要性：${item.importance}/5` : '',
-    item.reason ? `推荐理由：${item.reason}` : '',
-    item.summaryCn ? `中文摘要：${item.summaryCn}` : '',
-    item.summary ? `原始摘要：${item.summary}` : '',
-    keyPoints.length > 0 ? `核心要点：\n${keyPoints.map((point) => `- ${point}`).join('\n')}` : '',
-    tags.length > 0 ? `标签：${tags.join('、')}` : '',
-    item.contentExcerpt ? `正文片段：${item.contentExcerpt}` : '',
-  ]
-    .filter(Boolean)
-    .join('\n\n');
-}
+const encoder = new TextEncoder();
 
 function normalizeHistory(history: unknown): AssistantMessage[] {
   if (!Array.isArray(history)) {
@@ -58,70 +36,12 @@ function normalizeHistory(history: unknown): AssistantMessage[] {
     .slice(-8);
 }
 
-function formatReferenceContext(items: AssistantReferenceItem[]) {
-  if (items.length === 0) {
-    return '';
-  }
-
-  const itemBlocks = items.map((item) => {
-    const tags = parseJsonArray(item.tags);
-    const keyPoints = parseJsonArray(item.keyPoints);
-
-    return [
-      `[#${item.id}] ${item.titleCn || item.title}`,
-      `引用链接：${item.url}`,
-      `来源：${item.source}`,
-      item.publishedAt ? `发布时间：${item.publishedAt}` : '',
-      item.category ? `类型：${item.category}` : '',
-      item.importance ? `重要性：${item.importance}/5` : '',
-      item.reason ? `推荐理由：${item.reason}` : '',
-      item.summaryCn ? `中文摘要：${item.summaryCn}` : '',
-      item.summary ? `原始摘要：${item.summary}` : '',
-      keyPoints.length > 0 ? `核心要点：${keyPoints.join('；')}` : '',
-      tags.length > 0 ? `标签：${tags.join('、')}` : '',
-    ]
-      .filter(Boolean)
-      .join('\n');
-  });
-
-  return [
-    '可引用情报：',
-    '以下条目来自本地数据库。回答事实性结论时，如果使用了某条信息，请用 Markdown 链接引用，例如 [#123](https://example.com)。',
-    itemBlocks.join('\n\n'),
-  ].join('\n\n');
+function formatSseEvent(event: AssistantStreamEvent) {
+  return `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
 }
 
-function escapeMarkdownLabel(value: string) {
-  return value.replace(/[\[\]]/g, '').trim();
-}
-
-function escapeMarkdownUrl(value: string) {
-  return value.replace(/[<>]/g, '').trim();
-}
-
-function buildReferenceFooter(items: AssistantReferenceItem[]) {
-  if (items.length === 0) {
-    return '';
-  }
-
-  const lines = items.map((item) => {
-    const title = escapeMarkdownLabel(item.titleCn || item.title);
-    const url = escapeMarkdownUrl(item.url);
-    const source = item.source || '未知来源';
-    const importance = item.importance ? ` · ${item.importance}/5` : '';
-
-    return `- [#${item.id} ${title}](<${url}>) · ${source}${importance}`;
-  });
-
-  return `\n\n---\n参考情报\n${lines.join('\n')}`;
-}
-
-function encodeActionsHeader(actions: ReturnType<typeof buildAssistantActions>) {
-  if (actions.length === 0) {
-    return null;
-  }
-
-  return encodeURIComponent(JSON.stringify(actions));
+function enqueueEvent(controller: ReadableStreamDefaultController<Uint8Array>, event: AssistantStreamEvent) {
+  controller.enqueue(encoder.encode(formatSseEvent(event)));
 }
 
 export async function POST(request: NextRequest) {
@@ -136,82 +56,164 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const contexts: string[] = [];
-
-    if (body.itemId) {
-      const item = await getItemById(body.itemId);
-      if (!item) {
-        return NextResponse.json(
-          { error: '情报不存在' },
-          { status: 404 }
-        );
-      }
-      contexts.push(buildItemContext(item));
-    }
-
-    if (body.pageContent?.trim()) {
-      contexts.push(`当前页面展示内容：\n${body.pageContent.trim()}`);
-    }
-
-    if (contexts.length === 0) {
-      contexts.push('当前没有额外页面上下文。请基于用户问题直接回答，并在必要时提醒用户补充页面内容。');
-    }
-
-    const referenceItems = await getAssistantReferenceItems({
-      query: message,
-      itemId: body.itemId,
-    });
-    const referenceContext = formatReferenceContext(referenceItems);
-
-    if (referenceContext) {
-      contexts.push(referenceContext);
-    }
-
-    const actions = buildAssistantActions({
-      intent: body.intent,
-      message,
-      itemId: body.itemId,
-      hasReferences: referenceItems.length > 0,
-    });
-    const encodedActions = encodeActionsHeader(actions);
-
-    const completionStream = await createAssistantChatStream({
-      message,
-      context: contexts.join('\n\n---\n\n'),
-      history: normalizeHistory(body.history),
-    });
-
-    const encoder = new TextEncoder();
-    const referenceFooter = buildReferenceFooter(referenceItems);
     const stream = new ReadableStream({
       async start(controller) {
         try {
+          const contexts: string[] = [];
+
+          if (body.itemId) {
+            enqueueEvent(controller, {
+              type: 'tool_call',
+              id: 'get-current-item',
+              name: assistantTools.getCurrentItem.name,
+              label: assistantTools.getCurrentItem.label,
+            });
+
+            const currentItemResult = await getCurrentItemContextTool(body.itemId);
+            if (!currentItemResult) {
+              enqueueEvent(controller, {
+                type: 'error',
+                message: '情报不存在',
+              });
+              enqueueEvent(controller, { type: 'done' });
+              controller.close();
+              return;
+            }
+
+            contexts.push(currentItemResult.context);
+            enqueueEvent(controller, {
+              type: 'tool_result',
+              id: 'get-current-item',
+              name: assistantTools.getCurrentItem.name,
+              label: assistantTools.getCurrentItem.label,
+              summary: currentItemResult.summary,
+            });
+          }
+
+          if (body.pageContent?.trim()) {
+            contexts.push(`当前页面展示内容：\n${body.pageContent.trim()}`);
+          }
+
+          if (contexts.length === 0) {
+            contexts.push('当前没有额外页面上下文。请基于用户问题直接回答，并在必要时提醒用户补充页面内容。');
+          }
+
+          enqueueEvent(controller, {
+            type: 'tool_call',
+            id: 'search-references',
+            name: assistantTools.searchReferences.name,
+            label: assistantTools.searchReferences.label,
+          });
+
+          const referenceResult = await searchReferencesTool({
+            message,
+            itemId: body.itemId,
+          });
+
+          if (referenceResult.context) {
+            contexts.push(referenceResult.context);
+          }
+
+          enqueueEvent(controller, {
+            type: 'tool_result',
+            id: 'search-references',
+            name: assistantTools.searchReferences.name,
+            label: assistantTools.searchReferences.label,
+            summary: referenceResult.summary,
+          });
+
+          const actionResult = buildActionsTool({
+            intent: body.intent,
+            message,
+            itemId: body.itemId,
+            hasReferences: referenceResult.items.length > 0,
+          });
+
+          if (body.intent === 'today_focus') {
+            enqueueEvent(controller, {
+              type: 'tool_call',
+              id: 'build-daily-brief',
+              name: assistantTools.buildDailyBrief.name,
+              label: assistantTools.buildDailyBrief.label,
+            });
+
+            const dailyBrief = buildDailyBriefArtifactTool(referenceResult.items);
+            enqueueEvent(controller, {
+              type: 'artifact',
+              artifact: dailyBrief,
+            });
+            enqueueEvent(controller, {
+              type: 'tool_result',
+              id: 'build-daily-brief',
+              name: assistantTools.buildDailyBrief.name,
+              label: assistantTools.buildDailyBrief.label,
+              summary: `已生成 ${dailyBrief.topStories.length} 条重点日报`,
+            });
+          }
+
+          enqueueEvent(controller, {
+            type: 'tool_call',
+            id: 'generate-response',
+            name: assistantTools.generateResponse.name,
+            label: assistantTools.generateResponse.label,
+          });
+
+          const completionStream = await createAssistantChatStream({
+            message,
+            context: contexts.join('\n\n---\n\n'),
+            history: normalizeHistory(body.history),
+          });
+
           for await (const chunk of completionStream) {
             const content = chunk.choices[0]?.delta?.content;
             if (content) {
-              controller.enqueue(encoder.encode(content));
+              enqueueEvent(controller, {
+                type: 'delta',
+                content,
+              });
             }
+          }
+
+          if (referenceResult.footer) {
+            enqueueEvent(controller, {
+              type: 'delta',
+              content: referenceResult.footer,
+            });
+          }
+
+          enqueueEvent(controller, {
+            type: 'tool_result',
+            id: 'generate-response',
+            name: assistantTools.generateResponse.name,
+            label: assistantTools.generateResponse.label,
+            summary: '回答已生成',
+          });
+
+          if (actionResult.actions.length > 0) {
+            enqueueEvent(controller, {
+              type: 'actions',
+              actions: actionResult.actions,
+            });
           }
         } catch (error) {
           console.error('AI assistant stream failed:', error);
-          controller.error(error);
-          return;
+          enqueueEvent(controller, {
+            type: 'error',
+            message: 'AI 助手暂时不可用，请稍后重试',
+          });
         }
 
-        if (referenceFooter) {
-          controller.enqueue(encoder.encode(referenceFooter));
-        }
-
+        enqueueEvent(controller, { type: 'done' });
         controller.close();
       },
     });
 
     return new Response(stream, {
       headers: {
-        'Content-Type': 'text/plain; charset=utf-8',
+        'Content-Type': 'text/event-stream; charset=utf-8',
         'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
         'X-Content-Type-Options': 'nosniff',
-        ...(encodedActions ? { 'X-Assistant-Actions': encodedActions } : {}),
       },
     });
   } catch (error) {

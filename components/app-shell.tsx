@@ -61,11 +61,11 @@ export function AppShell({ children, stats }: AppShellProps) {
           </div>
         </header>
 
-        <main className={`flex-1 transition-[padding] duration-200 ${assistantOpen ? 'lg:pr-[416px]' : ''}`}>
+        <main className={`flex-1 transition-[padding] duration-200 ${assistantOpen ? 'lg:pr-[452px]' : ''}`}>
           {children}
         </main>
 
-        <footer className={`border-t border-orange-100/80 bg-white/70 transition-[padding] duration-200 ${assistantOpen ? 'lg:pr-[416px]' : ''}`}>
+        <footer className={`border-t border-orange-100/80 bg-white/70 transition-[padding] duration-200 ${assistantOpen ? 'lg:pr-[452px]' : ''}`}>
           <div className="mx-auto flex max-w-7xl flex-col gap-2 px-4 py-5 text-sm text-stone-500 sm:flex-row sm:items-center sm:justify-between sm:px-6 lg:px-8">
             <p>AI Daily Agent</p>
             <p>Turn scattered AI updates into readable and searchable daily briefs.</p>

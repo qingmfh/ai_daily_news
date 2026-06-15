@@ -18,14 +18,18 @@ import {
   Lightbulb,
   ListChecks,
   Loader2,
+  Pause,
   Search,
+  SendHorizontal,
   Wrench,
   X,
 } from 'lucide-react';
 import { usePathname } from 'next/navigation';
 import { AssistantActionCards } from '@/components/assistant-action-cards';
+import { AssistantArtifactCard } from '@/components/assistant-artifact-card';
 import { useAssistantPageContext } from '@/components/assistant-page-context';
 import { MarkdownRenderer } from '@/components/markdown-renderer';
+import type { AssistantArtifact, AssistantStreamEvent } from '@/lib/ai/assistant-events';
 import {
   getAssistantQuickIntents,
   type AssistantAction,
@@ -36,13 +40,22 @@ type ChatMessage = {
   role: 'user' | 'assistant';
   content: string;
   actions?: AssistantAction[];
+  activities?: AssistantActivity[];
+  artifacts?: AssistantArtifact[];
+};
+
+type AssistantActivity = {
+  id: string;
+  label: string;
+  status: 'running' | 'completed';
+  summary?: string;
 };
 
 interface AssistantPanelProps {
   onOpenChange?: (open: boolean) => void;
 }
 
-const PANEL_WIDTH = 384;
+const PANEL_WIDTH = 420;
 const PANEL_HEIGHT = 640;
 const PANEL_TOP_OFFSET = 72;
 const PANEL_BOTTOM_GAP = 8;
@@ -88,6 +101,7 @@ function appendToLastAssistant(messages: ChatMessage[], content: string): ChatMe
   for (let index = nextMessages.length - 1; index >= 0; index -= 1) {
     if (nextMessages[index].role === 'assistant') {
       nextMessages[index] = {
+        ...nextMessages[index],
         role: 'assistant',
         content: `${nextMessages[index].content}${content}`,
       };
@@ -102,12 +116,82 @@ function replaceLastAssistant(messages: ChatMessage[], content: string): ChatMes
   const nextMessages = [...messages];
   for (let index = nextMessages.length - 1; index >= 0; index -= 1) {
     if (nextMessages[index].role === 'assistant') {
-      nextMessages[index] = { role: 'assistant', content };
+      nextMessages[index] = { ...nextMessages[index], role: 'assistant', content };
       return nextMessages;
     }
   }
 
   return [...nextMessages, { role: 'assistant', content }];
+}
+
+function setLastAssistantActivity(
+  messages: ChatMessage[],
+  activity: AssistantActivity
+): ChatMessage[] {
+  const nextMessages = [...messages];
+
+  for (let index = nextMessages.length - 1; index >= 0; index -= 1) {
+    if (nextMessages[index].role !== 'assistant') {
+      continue;
+    }
+
+    const activities = nextMessages[index].activities || [];
+    const existingIndex = activities.findIndex((item) => item.id === activity.id);
+    const nextActivities = [...activities];
+
+    if (existingIndex >= 0) {
+      nextActivities[existingIndex] = {
+        ...nextActivities[existingIndex],
+        ...activity,
+      };
+    } else {
+      nextActivities.push(activity);
+    }
+
+    nextMessages[index] = {
+      ...nextMessages[index],
+      activities: nextActivities,
+    };
+    return nextMessages;
+  }
+
+  return messages;
+}
+
+function completeRunningAssistantActivities(messages: ChatMessage[], summary: string): ChatMessage[] {
+  const nextMessages = [...messages];
+
+  for (let index = nextMessages.length - 1; index >= 0; index -= 1) {
+    const item = nextMessages[index];
+    if (item.role !== 'assistant' || !item.activities?.length) {
+      continue;
+    }
+
+    nextMessages[index] = {
+      ...item,
+      activities: item.activities.map((activity) => (
+        activity.status === 'running'
+          ? { ...activity, status: 'completed', summary }
+          : activity
+      )),
+    };
+    return nextMessages;
+  }
+
+  return messages;
+}
+
+function getVisibleActivities(activities: AssistantActivity[] | undefined, hasOutput: boolean) {
+  if (!activities?.length) {
+    return [];
+  }
+
+  const runningActivities = activities.filter((activity) => activity.status === 'running');
+  if (runningActivities.length > 0) {
+    return runningActivities;
+  }
+
+  return hasOutput ? [] : activities;
 }
 
 function setLastAssistantActions(messages: ChatMessage[], actions: AssistantAction[]): ChatMessage[] {
@@ -129,16 +213,36 @@ function setLastAssistantActions(messages: ChatMessage[], actions: AssistantActi
   return messages;
 }
 
-function parseAssistantActions(value: string | null): AssistantAction[] {
-  if (!value) {
-    return [];
+function appendLastAssistantArtifact(
+  messages: ChatMessage[],
+  artifact: AssistantArtifact
+): ChatMessage[] {
+  const nextMessages = [...messages];
+
+  for (let index = nextMessages.length - 1; index >= 0; index -= 1) {
+    if (nextMessages[index].role === 'assistant') {
+      nextMessages[index] = {
+        ...nextMessages[index],
+        artifacts: [...(nextMessages[index].artifacts || []), artifact],
+      };
+      return nextMessages;
+    }
   }
 
+  return messages;
+}
+
+function parseSseBlock(block: string): AssistantStreamEvent | null {
   try {
-    const parsed = JSON.parse(decodeURIComponent(value));
-    return Array.isArray(parsed) ? parsed : [];
+    const data = block
+      .split('\n')
+      .filter((line) => line.startsWith('data:'))
+      .map((line) => line.slice(5).trimStart())
+      .join('\n');
+
+    return data ? JSON.parse(data) as AssistantStreamEvent : null;
   } catch {
-    return [];
+    return null;
   }
 }
 
@@ -182,6 +286,7 @@ export function AssistantPanel({ onOpenChange }: AssistantPanelProps) {
   const dragState = useRef<{ startX: number; startY: number; originX: number; originY: number } | null>(null);
   const desktopMessagesEndRef = useRef<HTMLDivElement | null>(null);
   const mobileMessagesEndRef = useRef<HTMLDivElement | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const panelHeight = getPanelHeight(viewportHeight);
   const quickIntents = getAssistantQuickIntents(itemId ? 'detail' : 'home');
 
@@ -283,8 +388,11 @@ export function AssistantPanel({ onOpenChange }: AssistantPanelProps) {
     setIsLoading(true);
 
     try {
+      const abortController = new AbortController();
+      abortControllerRef.current = abortController;
       const response = await fetch('/api/assistant/chat', {
         method: 'POST',
+        signal: abortController.signal,
         headers: {
           'Content-Type': 'application/json',
         },
@@ -306,9 +414,63 @@ export function AssistantPanel({ onOpenChange }: AssistantPanelProps) {
         throw new Error('AI 助手没有返回可读取的响应流');
       }
 
-      const actions = parseAssistantActions(response.headers.get('X-Assistant-Actions'));
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
+      let buffer = '';
+
+      const handleEvent = (event: AssistantStreamEvent | null) => {
+        if (!event) {
+          return;
+        }
+
+        if (event.type === 'delta') {
+          setMessages((current) => appendToLastAssistant(current, event.content));
+          return;
+        }
+
+        if (event.type === 'tool_call') {
+          setMessages((current) => setLastAssistantActivity(current, {
+            id: event.id,
+            label: event.label,
+            status: 'running',
+          }));
+          return;
+        }
+
+        if (event.type === 'tool_result') {
+          setMessages((current) => setLastAssistantActivity(current, {
+            id: event.id,
+            label: event.label,
+            status: 'completed',
+            summary: event.summary,
+          }));
+          return;
+        }
+
+        if (event.type === 'actions') {
+          setMessages((current) => setLastAssistantActions(current, event.actions));
+          return;
+        }
+
+        if (event.type === 'artifact') {
+          setMessages((current) => appendLastAssistantArtifact(current, event.artifact));
+          return;
+        }
+
+        if (event.type === 'error') {
+          setMessages((current) => replaceLastAssistant(current, `抱歉，${event.message}`));
+        }
+      };
+
+      const readEvents = (chunk: string) => {
+        buffer = `${buffer}${chunk}`.replace(/\r\n/g, '\n');
+        const blocks = buffer.split('\n\n');
+        buffer = blocks.pop() || '';
+
+        for (const block of blocks) {
+          handleEvent(parseSseBlock(block));
+        }
+      };
 
       while (true) {
         const { value, done } = await reader.read();
@@ -318,22 +480,35 @@ export function AssistantPanel({ onOpenChange }: AssistantPanelProps) {
 
         const chunk = decoder.decode(value, { stream: true });
         if (chunk) {
-          setMessages((current) => appendToLastAssistant(current, chunk));
+          readEvents(chunk);
         }
       }
 
       const rest = decoder.decode();
       if (rest) {
-        setMessages((current) => appendToLastAssistant(current, rest));
+        readEvents(rest);
       }
 
-      setMessages((current) => setLastAssistantActions(current, actions));
+      if (buffer.trim()) {
+        handleEvent(parseSseBlock(buffer));
+      }
     } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setMessages((current) => completeRunningAssistantActivities(current, '已停止'));
+        return;
+      }
+
       const errorMessage = err instanceof Error ? err.message : 'AI 助手请求失败';
       setMessages((current) => replaceLastAssistant(current, `抱歉，${errorMessage}`));
     } finally {
+      abortControllerRef.current = null;
       setIsLoading(false);
     }
+  };
+
+  const stopAssistant = () => {
+    abortControllerRef.current?.abort();
+    setIsLoading(false);
   };
 
   const handleComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -348,65 +523,111 @@ export function AssistantPanel({ onOpenChange }: AssistantPanelProps) {
   };
 
   const renderQuickIntents = () => (
-    <div className="mb-2 grid grid-cols-2 gap-2">
-      {quickIntents.map((intent) => {
-        const Icon = getIntentIcon(intent.id);
+    <div className="mb-3 rounded-xl border border-orange-100 bg-orange-50/45 p-2">
+      <div className="grid grid-cols-2 gap-2">
+        {quickIntents.map((intent) => {
+          const Icon = getIntentIcon(intent.id);
 
-        return (
-          <button
-            key={intent.id}
-            type="button"
-            title={intent.description}
-            disabled={isLoading}
-            onClick={() => void askAssistant(intent.message, intent.id)}
-            className="flex h-9 min-w-0 items-center gap-2 rounded-lg border border-orange-100 bg-white px-2.5 text-left text-xs font-medium text-stone-700 transition-colors hover:border-orange-200 hover:bg-orange-50 disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            <Icon className="size-3.5 shrink-0 text-orange-700" />
-            <span className="truncate">{intent.label}</span>
-          </button>
-        );
-      })}
+          return (
+            <button
+              key={intent.id}
+              type="button"
+              title={intent.description}
+              disabled={isLoading}
+              onClick={() => void askAssistant(intent.message, intent.id)}
+              className="flex h-10 min-w-0 items-center gap-2 rounded-lg border border-orange-100 bg-white px-2.5 text-left text-xs font-medium text-stone-700 shadow-sm shadow-orange-900/4 transition-colors hover:border-orange-200 hover:bg-orange-50 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <Icon className="size-3.5 shrink-0 text-orange-700" />
+              <span className="truncate">{intent.label}</span>
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 
-  const renderMessages = (endRef: typeof desktopMessagesEndRef, mobile = false) => (
-    <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain rounded-lg border border-orange-100 bg-white p-3">
-      {messages.map((item, index) => (
-        <div
-          key={`${mobile ? 'mobile-' : ''}${item.role}-${index}`}
-          className={`rounded-2xl px-3 py-2 text-sm leading-6 ${
-            item.role === 'user'
-              ? `${mobile ? 'max-w-[90%]' : 'max-w-[88%]'} ml-auto bg-orange-600 text-white`
-              : `${mobile ? 'max-w-[94%]' : 'max-w-[92%]'} mr-auto bg-orange-50 text-stone-700`
-          }`}
-        >
-          {item.role === 'assistant' ? (
-            item.content ? (
-              <>
-                <MarkdownRenderer content={item.content} />
-                <AssistantActionCards
-                  actions={item.actions}
-                  disabled={isLoading}
-                  onPrompt={(nextMessage, intent) => void askAssistant(nextMessage, intent)}
-                />
-              </>
+  const renderActivities = (activities?: AssistantActivity[], hasOutput = false) => {
+    const visibleActivities = getVisibleActivities(activities, hasOutput);
+
+    if (visibleActivities.length === 0) {
+      return null;
+    }
+
+    return (
+      <div className="mb-3 space-y-1.5">
+        {visibleActivities.map((activity) => (
+          <div
+            key={activity.id}
+            className="flex items-start gap-2 rounded-lg border border-orange-100 bg-white px-2.5 py-2 text-xs leading-5 text-stone-600"
+          >
+            {activity.status === 'running' ? (
+              <Loader2 className="mt-0.5 size-3.5 shrink-0 animate-spin text-orange-700" />
             ) : (
-              <span className="inline-flex items-center gap-2 text-stone-500">
-                <Loader2 className="size-4 animate-spin text-orange-700" />
-                Thinking
-              </span>
-            )
-          ) : (
-            <p className="whitespace-pre-wrap">{item.content}</p>
-          )}
-        </div>
-      ))}
+              <span className="mt-1 size-2 shrink-0 rounded-full bg-teal-500" />
+            )}
+            <span className="min-w-0">
+              <span className="font-medium text-stone-800">{activity.label}</span>
+              {activity.summary && (
+                <span className="block text-stone-500">{activity.summary}</span>
+              )}
+            </span>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  const renderMessages = (endRef: typeof desktopMessagesEndRef, mobile = false) => (
+    <div className="min-h-0 flex-1 space-y-3 overflow-y-auto overscroll-contain rounded-xl border border-orange-100 bg-white p-3">
+      {messages.map((item, index) => {
+        const hasWorkbenchOutput = Boolean(item.actions?.length || item.artifacts?.length);
+        const hasAssistantOutput = Boolean(item.content || item.actions?.length || item.artifacts?.length);
+
+        return (
+          <div
+            key={`${mobile ? 'mobile-' : ''}${item.role}-${index}`}
+            className={`text-sm leading-6 ${
+              item.role === 'user'
+                ? `${mobile ? 'max-w-[90%]' : 'max-w-[86%]'} ml-auto rounded-2xl bg-orange-600 px-3 py-2 text-white`
+                : `${hasWorkbenchOutput ? 'w-full rounded-xl border border-orange-100 bg-orange-50/55 p-2.5' : `${mobile ? 'max-w-[94%]' : 'max-w-[90%]'} mr-auto rounded-2xl bg-orange-50 px-3 py-2`} text-stone-700`
+            }`}
+          >
+            {item.role === 'assistant' ? (
+              hasAssistantOutput || item.activities?.length ? (
+                <>
+                  {renderActivities(item.activities, hasAssistantOutput)}
+                  {item.artifacts?.map((artifact) => (
+                    <AssistantArtifactCard key={artifact.id} artifact={artifact} />
+                  ))}
+                  {item.content && (
+                    <div className={item.artifacts?.length ? 'mt-3' : undefined}>
+                      <MarkdownRenderer content={item.content} />
+                    </div>
+                  )}
+                  <AssistantActionCards
+                    actions={item.actions}
+                    disabled={isLoading}
+                    onPrompt={(nextMessage, intent) => void askAssistant(nextMessage, intent)}
+                  />
+                </>
+              ) : (
+                <span className="inline-flex items-center gap-2 text-stone-500">
+                  <Loader2 className="size-4 animate-spin text-orange-700" />
+                  思考中
+                </span>
+              )
+            ) : (
+              <p className="whitespace-pre-wrap">{item.content}</p>
+            )}
+          </div>
+        );
+      })}
       <div ref={endRef} />
     </div>
   );
 
   const renderComposer = () => (
-    <div className="mt-2 overflow-hidden rounded-lg border border-orange-100 bg-white">
+    <div className="mt-3 flex items-end gap-2 rounded-xl border border-orange-100 bg-white p-2 shadow-sm shadow-orange-900/4">
       <textarea
         value={message}
         onChange={(event) => setMessage(event.target.value)}
@@ -415,8 +636,24 @@ export function AssistantPanel({ onOpenChange }: AssistantPanelProps) {
         placeholder="输入消息，Enter 发送，Shift+Enter 换行"
         aria-label="AI 助手对话输入框"
         disabled={isLoading}
-        className="max-h-28 min-h-16 w-full resize-none border-0 bg-transparent px-3 py-2.5 text-sm leading-6 text-stone-700 outline-none placeholder:text-stone-400 disabled:cursor-not-allowed disabled:opacity-60"
+        className="max-h-28 min-h-16 flex-1 resize-none border-0 bg-transparent px-1 py-1.5 text-sm leading-6 text-stone-700 outline-none placeholder:text-stone-400 disabled:cursor-not-allowed disabled:opacity-60"
       />
+      <button
+        type="button"
+        onClick={() => {
+          if (isLoading) {
+            stopAssistant();
+            return;
+          }
+          void askAssistant(message);
+        }}
+        disabled={!isLoading && !message.trim()}
+        className="mb-1 flex size-9 shrink-0 items-center justify-center rounded-lg bg-orange-600 text-white transition-colors hover:bg-orange-700 disabled:cursor-not-allowed disabled:bg-orange-200"
+        aria-label={isLoading ? '停止 AI 助手回答' : '发送消息'}
+        title={isLoading ? '停止回答' : '发送'}
+      >
+        {isLoading ? <Pause className="size-4" /> : <SendHorizontal className="size-4" />}
+      </button>
     </div>
   );
 
@@ -441,7 +678,7 @@ export function AssistantPanel({ onOpenChange }: AssistantPanelProps) {
           style={{ left: `${desktopPosition.x}px`, top: `${desktopPosition.y}px` }}
         >
           <aside
-            className="surface-soft flex w-[384px] flex-col overflow-hidden rounded-xl bg-white/96"
+            className="surface-soft flex w-[420px] flex-col overflow-hidden rounded-xl bg-white/96"
             style={{ height: `${panelHeight}px` }}
           >
             <div
